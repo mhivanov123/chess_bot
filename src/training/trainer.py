@@ -134,11 +134,14 @@ class ChessTrainer:
             
             episode_reward += reward
             episode_length += 1
+
+            if done or truncated:
+                break
+
             state = next_state
             legal_actions = next_legal_actions
             
-            if done or truncated:
-                break
+            
         
         # Decay epsilon
         self.agent.decay_epsilon()

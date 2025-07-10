@@ -148,6 +148,11 @@ class DQNAgent:
         Select action using epsilon-greedy policy.
         Only considers legal actions.
         """
+        # Safety check for empty legal actions
+        if not legal_actions:
+            print(f"Warning: No legal actions available! Board state: {self.env.board.fen()}")
+            return 0  # Return first action as fallback
+        
         if self.training and random.random() < self.epsilon:
             # Random action from legal moves
             return random.choice(legal_actions)
