@@ -1,0 +1,42 @@
+# DQN Configuration for Chess Agent
+
+# Environment settings
+environment:
+  max_moves: 200  # Maximum moves per game
+  reward_win: 1.0
+  reward_draw: 0.0
+  reward_loss: -1.0
+  reward_material_factor: 0.1  # Factor for material advantage reward
+
+# Agent settings
+agent:
+  type: "dqn"
+  learning_rate: 0.001
+  gamma: 0.99  # Discount factor
+  epsilon_start: 1.0
+  epsilon_end: 0.01
+  epsilon_decay: 0.995
+  target_update_freq: 1000  # Update target network every N steps
+
+# Network architecture
+network:
+  hidden_layers: [512, 256, 128]
+  activation: "relu"
+  dropout: 0.1
+
+# Training settings
+training:
+  batch_size: 64
+  buffer_size: 100000  # Replay buffer size
+  min_buffer_size: 1000  # Minimum samples before training
+  update_freq: 4  # Update every N steps
+  num_episodes: 10000
+  eval_freq: 100  # Evaluate every N episodes
+  save_freq: 500  # Save model every N episodes
+
+# Logging
+logging:
+  log_dir: "logs"
+  tensorboard: true
+  save_models: true
+  model_dir: "models" 
