@@ -209,7 +209,11 @@ class ChessEnv(gym.Env):
         
         if not legal:
             # Illegal move - penalize heavily
-            return self._board_to_state(), -10.0, True, False, {'illegal_move': True}
+            # FIXED: Include legal_actions in the info dictionary
+            return self._board_to_state(), -10.0, True, False, {
+                'illegal_move': True,
+                'legal_actions': self._get_legal_actions()  # Add this line
+            }
         
         self.move_count += 1
         
