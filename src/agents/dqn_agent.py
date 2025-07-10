@@ -150,7 +150,7 @@ class DQNAgent:
         """
         # Safety check for empty legal actions
         if not legal_actions:
-            print(f"Warning: No legal actions available! Board state: {self.env.board.fen()}")
+            print(f"Warning: No legal actions available!")
             return 0  # Return first action as fallback
         
         if self.training and random.random() < self.epsilon:

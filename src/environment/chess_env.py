@@ -34,18 +34,32 @@ class ChessEnv(gym.Env):
         
     def _init_action_space(self):
         """Initialize the mapping between moves and action indices."""
-        # Generate all possible moves (from square, to square)
         moves = []
+        
+        # Generate all possible moves (from square, to square)
         for from_square in chess.SQUARES:
             for to_square in chess.SQUARES:
                 if from_square != to_square:
                     moves.append((from_square, to_square))
         
-        # Add promotion moves
-        for from_square in range(8, 16):  # Pawns on second rank
-            for to_square in range(0, 8):  # Promotion squares
-                for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
-                    moves.append((from_square, to_square, piece))
+        # Add promotion moves for all pawn positions
+        for from_square in chess.SQUARES:
+            rank = chess.square_rank(from_square)
+            # Pawns on 7th rank (for white) or 2nd rank (for black) can promote
+            if rank == 6 or rank == 1:  # 7th rank for white, 2nd rank for black
+                for to_square in chess.SQUARES:
+                    to_rank = chess.square_rank(to_square)
+                    # Promotion to 8th rank (for white) or 1st rank (for black)
+                    if to_rank == 7 or to_rank == 0:
+                        for piece in [chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT]:
+                            moves.append((from_square, to_square, piece))
+        
+        # Add castling moves
+        moves.append(('O-O',))  # Kingside castling
+        moves.append(('O-O-O',))  # Queenside castling
+        
+        # Add en passant moves (these will be handled dynamically)
+        # We'll add a special action for en passant
         
         # Create mappings
         for i, move in enumerate(moves):
