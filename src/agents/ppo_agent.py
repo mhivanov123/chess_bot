@@ -56,6 +56,23 @@ class ChessActorCritic(nn.Module):
             action_logits = action_logits + mask
         
         return F.softmax(action_logits, dim=-1), value
+    
+    def get_action_probs_batch(self, x, legal_actions_list: List[List[int]] = None):
+        """Get action probabilities for a batch with individual masking."""
+        action_logits, value = self.forward(x)
+        
+        if legal_actions_list is not None:
+            # Apply masking for each sample in the batch
+            for i, legal_actions in enumerate(legal_actions_list):
+                if legal_actions:  # Only mask if there are legal actions
+                    mask = torch.ones(action_logits.size(1), device=action_logits.device) * float('-inf')
+                    # Ensure legal actions are within bounds
+                    valid_actions = [a for a in legal_actions if 0 <= a < action_logits.size(1)]
+                    if valid_actions:
+                        mask[valid_actions] = 0
+                    action_logits[i] = action_logits[i] + mask
+        
+        return F.softmax(action_logits, dim=-1), value
 
 
 class PPOMemory:
@@ -110,6 +127,7 @@ class PPOAgent:
         self.value_coef = value_coef
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
+        self.num_actions = num_actions
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device == 'auto' else torch.device(device)
         
@@ -174,7 +192,8 @@ class PPOAgent:
         
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         
-        action_probs, values = self.network.get_action_probs(states, legal_actions_list)
+        # Use the batch version of get_action_probs
+        action_probs, values = self.network.get_action_probs_batch(states, legal_actions_list)
         action_probs_taken = action_probs.gather(1, actions.unsqueeze(1)).squeeze()
         
         ratio = action_probs_taken / (old_action_probs + 1e-8)
