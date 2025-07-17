@@ -1,0 +1,38 @@
+# PPO Configuration for Chess Agent
+
+# Environment settings
+environment:
+  max_moves: 200  # Maximum moves per game
+  reward_material_factor: 0.1  # Factor for material advantage reward
+
+# Agent settings
+agent:
+  type: "ppo"
+  learning_rate: 0.0003
+  gamma: 0.99  # Discount factor
+  gae_lambda: 0.95  # GAE lambda parameter
+  clip_ratio: 0.2  # PPO clip ratio
+  value_coef: 0.5  # Value function coefficient
+  entropy_coef: 0.01  # Entropy coefficient
+  max_grad_norm: 0.5  # Maximum gradient norm
+
+# Network architecture
+network:
+  hidden_layers: [512, 256, 128]
+  activation: "relu"
+  dropout: 0.1
+
+# Training settings
+training:
+  steps_per_update: 2048  # Steps to collect before updating
+  ppo_epochs: 10  # Number of PPO epochs per update
+  num_episodes: 10000
+  eval_freq: 100  # Evaluate every N episodes
+  save_freq: 500  # Save model every N episodes
+
+# Logging
+logging:
+  log_dir: "logs"
+  tensorboard: true
+  save_models: true
+  model_dir: "models" 

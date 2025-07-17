@@ -16,7 +16,7 @@ class ChessNet(nn.Module):
     """
     
     def __init__(self, input_channels: int = 12, hidden_layers: List[int] = [512, 256, 128], 
-                 num_actions: int = 4096, dropout: float = 0.1):
+                 num_actions: int = 4352, dropout: float = 0.1):
         super(ChessNet, self).__init__()
         
         self.input_channels = input_channels
@@ -150,7 +150,7 @@ class DQNAgent:
         """
         # Safety check for empty legal actions
         if not legal_actions:
-            print(f"Warning: No legal actions available!")
+            print("Warning: No legal actions available!")
             return 0  # Return first action as fallback
         
         if self.training and random.random() < self.epsilon:
@@ -163,9 +163,9 @@ class DQNAgent:
                 q_values = self.q_network(state_tensor)
                 
                 # Mask illegal actions with large negative values
-                mask = torch.ones(self.num_actions) * float('-inf')
+                mask = torch.ones(self.num_actions, device=self.device) * float('-inf')
                 mask[legal_actions] = 0
-                q_values = q_values + mask.to(self.device)
+                q_values = q_values + mask
                 
                 return q_values.argmax().item()
     
@@ -192,9 +192,9 @@ class DQNAgent:
             
             # Mask illegal actions
             for i, legal_actions in enumerate(legal_actions_list):
-                mask = torch.ones(self.num_actions) * float('-inf')
+                mask = torch.ones(self.num_actions, device=self.device) * float('-inf')
                 mask[legal_actions] = 0
-                next_q_values[i] = next_q_values[i] + mask.to(self.device)
+                next_q_values[i] = next_q_values[i] + mask
             
             max_next_q_values = next_q_values.max(1)[0]
             target_q_values = rewards + (self.gamma * max_next_q_values * ~dones)

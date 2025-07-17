@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
 """
-Main training script for the chess RL agent.
+Main training script for the chess PPO agent.
 """
 
 import argparse
 import os
 import sys
-from src.training.trainer import ChessTrainer
 from src.training.ppo_trainer import PPOTrainer
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Train a chess RL agent')
+    parser = argparse.ArgumentParser(description='Train a chess PPO agent')
     parser.add_argument('--config', type=str, default='configs/ppo_config.yaml',
                        help='Path to configuration file')
-    parser.add_argument('--agent', type=str, choices=['dqn', 'ppo'], default='ppo',
-                       help='Type of agent to train (default: ppo)')
     parser.add_argument('--plot', action='store_true',
                        help='Plot training curves after training')
     parser.add_argument('--plot_save', type=str, default=None,
@@ -29,13 +26,9 @@ def main():
         sys.exit(1)
     
     try:
-        # Initialize trainer based on agent type
+        # Initialize trainer
         print(f"Loading configuration from {args.config}")
-        
-        if args.agent == 'ppo':
-            trainer = PPOTrainer(args.config)
-        else:
-            trainer = ChessTrainer(args.config)
+        trainer = PPOTrainer(args.config)
         
         # Start training
         trainer.train()
@@ -52,8 +45,6 @@ def main():
         sys.exit(0)
     except Exception as e:
         print(f"Error during training: {e}")
-        import traceback
-        traceback.print_exc()
         sys.exit(1)
 
 

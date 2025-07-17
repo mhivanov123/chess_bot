@@ -8,13 +8,13 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 from ..environment.chess_env import ChessEnv
-from ..agents.dqn_agent import DQNAgent, ReplayBuffer
+from ..agents.ppo_agent import PPOAgent
 from ..utils.config import load_config
 
 
-class ChessTrainer:
+class PPOTrainer:
     """
-    Main trainer class for training chess agents.
+    PPO trainer for chess agents.
     """
     
     def __init__(self, config_path: str):
@@ -44,33 +44,30 @@ class ChessTrainer:
         )
         
     def setup_agent(self):
-        """Setup the DQN agent."""
+        """Setup the PPO agent."""
         agent_config = self.config['agent']
         network_config = self.config['network']
         training_config = self.config['training']
         
-        self.agent = DQNAgent(
+        self.agent = PPOAgent(
             state_shape=self.env.observation_space.shape,
             num_actions=self.env.action_space.n,
             hidden_layers=network_config['hidden_layers'],
             learning_rate=agent_config['learning_rate'],
             gamma=agent_config['gamma'],
-            epsilon=agent_config['epsilon_start'],
-            epsilon_min=agent_config['epsilon_end'],
-            epsilon_decay=agent_config['epsilon_decay']
+            gae_lambda=agent_config['gae_lambda'],
+            clip_ratio=agent_config['clip_ratio'],
+            value_coef=agent_config['value_coef'],
+            entropy_coef=agent_config['entropy_coef'],
+            max_grad_norm=agent_config['max_grad_norm']
         )
         
-        # Setup replay buffer
-        self.replay_buffer = ReplayBuffer(training_config['buffer_size'])
-        
         # Training parameters
-        self.batch_size = training_config['batch_size']
-        self.min_buffer_size = training_config['min_buffer_size']
-        self.update_freq = training_config['update_freq']
-        self.target_update_freq = agent_config['target_update_freq']
+        self.steps_per_update = training_config['steps_per_update']
         self.num_episodes = training_config['num_episodes']
         self.eval_freq = training_config['eval_freq']
         self.save_freq = training_config['save_freq']
+        self.ppo_epochs = training_config['ppo_epochs']
         
     def setup_logging(self):
         """Setup logging directories and tensorboard."""
@@ -92,45 +89,32 @@ class ChessTrainer:
         else:
             self.use_tensorboard = False
     
-    def train_episode(self) -> Tuple[float, int, List[float]]:
+    def collect_trajectory(self) -> Tuple[float, int]:
         """
-        Train for one episode.
+        Collect one trajectory using current policy.
         
         Returns:
             episode_reward: Total reward for the episode
             episode_length: Number of steps in the episode
-            episode_losses: List of losses during the episode
         """
         state, info = self.env.reset()
         legal_actions = info['legal_actions']
         
         episode_reward = 0
         episode_length = 0
-        episode_losses = []
         
         while True:
             # Select action
-            action = self.agent.select_action(state, legal_actions)
+            action, action_prob, value = self.agent.select_action(state, legal_actions)
             
             # Take action
             next_state, reward, done, truncated, info = self.env.step(action)
             next_legal_actions = info['legal_actions']
             
             # Store transition
-            self.replay_buffer.push(
-                state, action, reward, next_state, done, legal_actions
+            self.agent.memory.push(
+                state, action, reward, value, action_prob, legal_actions, done
             )
-            
-            # Train if enough samples
-            if len(self.replay_buffer) >= self.min_buffer_size and episode_length % self.update_freq == 0:
-                batch = self.replay_buffer.sample(self.batch_size)
-                loss = self.agent.train_step(batch)
-                episode_losses.append(loss)
-                self.losses.append(loss)
-                
-                # Update target network
-                if len(self.losses) % self.target_update_freq == 0:
-                    self.agent.update_target_network()
             
             episode_reward += reward
             episode_length += 1
@@ -139,12 +123,35 @@ class ChessTrainer:
             
             if done or truncated:
                 break
-            
         
-        # Decay epsilon
-        self.agent.decay_epsilon()
+        return episode_reward, episode_length
+    
+    def update_policy(self) -> List[Dict[str, float]]:
+        """
+        Update policy using collected trajectory.
         
-        return episode_reward, episode_length, episode_losses
+        Returns:
+            List of loss dictionaries for each PPO epoch
+        """
+        # Get trajectory data
+        states, actions, rewards, values, action_probs, legal_actions_list, dones = \
+            self.agent.memory.get_batch()
+        
+        # Compute GAE returns
+        returns, advantages = self.agent.compute_gae_returns(rewards, values, dones)
+        
+        # Train for multiple epochs
+        epoch_losses = []
+        for _ in range(self.ppo_epochs):
+            loss_dict = self.agent.train_step(
+                states, actions, returns, advantages, action_probs, legal_actions_list
+            )
+            epoch_losses.append(loss_dict)
+        
+        # Clear memory
+        self.agent.memory.clear()
+        
+        return epoch_losses
     
     def evaluate_agent(self, num_games: int = 10) -> Dict[str, float]:
         """
@@ -169,7 +176,7 @@ class ChessTrainer:
             game_moves = 0
             
             while True:
-                action = self.agent.select_action(state, legal_actions)
+                action, _, _ = self.agent.select_action(state, legal_actions)
                 state, reward, done, truncated, info = self.env.step(action)
                 legal_actions = info['legal_actions']
                 game_moves += 1
@@ -199,28 +206,42 @@ class ChessTrainer:
     
     def train(self):
         """Main training loop."""
-        print(f"Starting training for {self.num_episodes} episodes...")
+        print(f"Starting PPO training for {self.num_episodes} episodes...")
         print(f"Device: {self.agent.device}")
         
         start_time = time.time()
+        total_steps = 0
         
         for episode in tqdm(range(self.num_episodes), desc="Training"):
-            # Train one episode
-            episode_reward, episode_length, episode_losses = self.train_episode()
+            # Collect trajectory
+            episode_reward, episode_length = self.collect_trajectory()
+            total_steps += episode_length
             
             # Store metrics
             self.episode_rewards.append(episode_reward)
             self.episode_lengths.append(episode_length)
             
-            # Log to tensorboard
+            # Update policy if enough steps collected
+            if total_steps >= self.steps_per_update:
+                epoch_losses = self.update_policy()
+                
+                # Store average losses
+                avg_losses = {}
+                for key in epoch_losses[0].keys():
+                    avg_losses[key] = np.mean([loss[key] for loss in epoch_losses])
+                
+                self.losses.append(avg_losses)
+                total_steps = 0
+                
+                # Log to tensorboard
+                if self.use_tensorboard:
+                    for key, value in avg_losses.items():
+                        self.writer.add_scalar(f'Training/{key}', value, episode)
+            
+            # Log episode metrics
             if self.use_tensorboard:
                 self.writer.add_scalar('Training/Episode_Reward', episode_reward, episode)
                 self.writer.add_scalar('Training/Episode_Length', episode_length, episode)
-                self.writer.add_scalar('Training/Epsilon', self.agent.epsilon, episode)
-                
-                if episode_losses:
-                    avg_loss = np.mean(episode_losses)
-                    self.writer.add_scalar('Training/Average_Loss', avg_loss, episode)
             
             # Evaluation
             if episode % self.eval_freq == 0:
@@ -230,10 +251,14 @@ class ChessTrainer:
                 print(f"\nEpisode {episode}:")
                 print(f"  Reward: {episode_reward:.2f}")
                 print(f"  Length: {episode_length}")
-                print(f"  Epsilon: {self.agent.epsilon:.3f}")
                 print(f"  Win Rate: {eval_results['win_rate']:.2f}")
                 print(f"  Draw Rate: {eval_results['draw_rate']:.2f}")
                 print(f"  Loss Rate: {eval_results['loss_rate']:.2f}")
+                
+                if self.losses:
+                    latest_loss = self.losses[-1]
+                    print(f"  Policy Loss: {latest_loss['policy_loss']:.6f}")
+                    print(f"  Value Loss: {latest_loss['value_loss']:.6f}")
                 
                 if self.use_tensorboard:
                     self.writer.add_scalar('Evaluation/Win_Rate', eval_results['win_rate'], episode)
@@ -245,7 +270,7 @@ class ChessTrainer:
             if episode % self.save_freq == 0:
                 model_path = os.path.join(
                     self.config['logging']['model_dir'],
-                    f'chess_agent_episode_{episode}.pth'
+                    f'chess_ppo_episode_{episode}.pth'
                 )
                 self.agent.save(model_path)
                 print(f"Model saved to {model_path}")
@@ -253,7 +278,7 @@ class ChessTrainer:
         # Final save
         final_model_path = os.path.join(
             self.config['logging']['model_dir'],
-            'chess_agent_final.pth'
+            'chess_ppo_final.pth'
         )
         self.agent.save(final_model_path)
         
@@ -282,10 +307,15 @@ class ChessTrainer:
         
         # Losses
         if self.losses:
-            axes[1, 0].plot(self.losses)
+            policy_losses = [loss['policy_loss'] for loss in self.losses]
+            value_losses = [loss['value_loss'] for loss in self.losses]
+            
+            axes[1, 0].plot(policy_losses, label='Policy Loss')
+            axes[1, 0].plot(value_losses, label='Value Loss')
             axes[1, 0].set_title('Training Losses')
             axes[1, 0].set_xlabel('Update Step')
             axes[1, 0].set_ylabel('Loss')
+            axes[1, 0].legend()
         
         # Evaluation metrics
         if self.eval_results:
