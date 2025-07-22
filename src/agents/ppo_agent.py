@@ -217,10 +217,6 @@ class PPOAgent:
         if not legal_actions:
             # No legal actions: return dummy action (should only happen in terminal states)
             return 0, 0.0, 0.0
-        
-        # Update epsilon if annealing is enabled
-        self.update_epsilon()
-        
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             # Use action masking: only legal actions are considered
@@ -233,18 +229,12 @@ class PPOAgent:
             # Clamp probabilities before log and normalization
             masked_probs = torch.clamp(masked_probs, min=1e-8, max=1.0)
             masked_probs = masked_probs / masked_probs.sum()  # Renormalize
-            
-            # Epsilon-greedy exploration
-            if self.training and np.random.random() < self.epsilon:
-                action_idx = np.random.randint(len(legal_actions))
-                action_prob = 1.0 / len(legal_actions)
+            if self.training:
+                action_dist = torch.distributions.Categorical(masked_probs)
+                action_idx = action_dist.sample().item()
             else:
-                if self.training:
-                    action_dist = torch.distributions.Categorical(masked_probs)
-                    action_idx = action_dist.sample().item()
-                else:
-                    action_idx = masked_probs.argmax().item()
-                action_prob = masked_probs[action_idx].item()
+                action_idx = masked_probs.argmax().item()
+            action_prob = masked_probs[action_idx].item()
             selected_action = legal_actions[action_idx]
             return selected_action, action_prob, value.item()
     
