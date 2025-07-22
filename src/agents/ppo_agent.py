@@ -217,54 +217,35 @@ class PPOAgent:
         if not legal_actions:
             # No legal actions: return dummy action (should only happen in terminal states)
             return 0, 0.0, 0.0
+        
+        # Update epsilon if annealing is enabled
+        self.update_epsilon()
+        
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
             # Use action masking: only legal actions are considered
             action_probs, value = self.network.get_action_probs(state_tensor, legal_actions)
-            
-            # DEBUG: Get the raw logits to understand the root cause
             action_logits, _ = self.network.forward(state_tensor)
             logits_for_legal = action_logits[0, legal_actions]
+            # Numerically stable: clamp logits before softmax
+            logits_for_legal = torch.clamp(logits_for_legal, min=-20, max=20)
+            masked_probs = torch.softmax(logits_for_legal, dim=-1)
+            # Clamp probabilities before log and normalization
+            masked_probs = torch.clamp(masked_probs, min=1e-8, max=1.0)
+            masked_probs = masked_probs / masked_probs.sum()  # Renormalize
             
-            masked_probs = action_probs[0, legal_actions]
-            masked_probs_sum = masked_probs.sum().item()
-            
-            # Debug prints
-            if torch.isnan(masked_probs).any() or masked_probs_sum == 0.0:
-                print("[WARNING] Invalid masked_probs in select_action!")
-                print(f"  legal_actions: {legal_actions}")
-                print(f"  masked_probs: {masked_probs}")
-                print(f"  masked_probs_sum: {masked_probs_sum}")
-                print(f"  action_probs: {action_probs[0]}")
-                print(f"  DEBUG - Raw logits for legal actions: {logits_for_legal}")
-                print(f"  DEBUG - Raw logits min/max: {action_logits.min().item():.6f}/{action_logits.max().item():.6f}")
-                print(f"  DEBUG - Raw logits mean/std: {action_logits.mean().item():.6f}/{action_logits.std().item():.6f}")
-                print(f"  DEBUG - Logits for legal actions min/max: {logits_for_legal.min().item():.6f}/{logits_for_legal.max().item():.6f}")
-                
-                # Check if this is a network initialization issue
-                if hasattr(self, '_debug_count'):
-                    self._debug_count += 1
+            # Epsilon-greedy exploration
+            if self.training and np.random.random() < self.epsilon:
+                action_idx = np.random.randint(len(legal_actions))
+                action_prob = 1.0 / len(legal_actions)
+            else:
+                if self.training:
+                    action_dist = torch.distributions.Categorical(masked_probs)
+                    action_idx = action_dist.sample().item()
                 else:
-                    self._debug_count = 1
-                
-                if self._debug_count <= 3:  # Only print detailed network info for first few occurrences
-                    print(f"  DEBUG - Network parameters stats:")
-                    for name, param in self.network.named_parameters():
-                        if param.requires_grad:
-                            print(f"    {name}: mean={param.mean().item():.6f}, std={param.std().item():.6f}, min={param.min().item():.6f}, max={param.max().item():.6f}")
-                
-                # Fallback: uniform distribution over legal actions
-                masked_probs = torch.ones(len(legal_actions), device=self.device) / len(legal_actions)
-            else:
-                masked_probs = masked_probs / masked_probs_sum  # Renormalize
-            if self.training:
-                action_dist = torch.distributions.Categorical(masked_probs)
-                action_idx = action_dist.sample().item()
-            else:
-                action_idx = masked_probs.argmax().item()
-            # Map back to the actual action index in the full action space
+                    action_idx = masked_probs.argmax().item()
+                action_prob = masked_probs[action_idx].item()
             selected_action = legal_actions[action_idx]
-            action_prob = masked_probs[action_idx].item()
             return selected_action, action_prob, value.item()
     
     def compute_gae_returns(self, rewards, values, dones):
@@ -314,18 +295,28 @@ class PPOAgent:
         advantages = torch.FloatTensor(advantages).to(self.device)
         old_action_probs = torch.FloatTensor(old_action_probs).to(self.device)
         
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        # Numerically stable advantage normalization
+        if advantages.std() > 1e-8:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        else:
+            advantages = advantages - advantages.mean()
         
         # Use the batch version of get_action_probs
         action_probs, values = self.network.get_action_probs_batch(states, legal_actions_list)
+        # Clamp probabilities before log and normalization
+        action_probs = torch.clamp(action_probs, min=1e-8, max=1.0)
+        action_probs = action_probs / action_probs.sum(dim=1, keepdim=True)
         action_probs_taken = action_probs.gather(1, actions.unsqueeze(1)).squeeze()
         
+        # Numerically stable ratio calculation
         ratio = action_probs_taken / (old_action_probs + 1e-8)
+        
         surr1 = ratio * advantages
         surr2 = torch.clamp(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio) * advantages
         policy_loss = -torch.min(surr1, surr2).mean()
         
         value_loss = F.mse_loss(values.squeeze(), returns)
+        # Numerically stable entropy calculation
         entropy = -(action_probs * torch.log(action_probs + 1e-8)).sum(dim=1).mean()
         
         total_loss = policy_loss + self.value_coef * value_loss + self.entropy_coef * (-entropy)
