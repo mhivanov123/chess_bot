@@ -13,7 +13,11 @@ agent:
   gae_lambda: 0.95  # GAE lambda parameter
   clip_ratio: 0.2  # PPO clip ratio
   value_coef: 0.5  # Value function coefficient
-  entropy_coef: 0.01  # Entropy coefficient
+  entropy_coef: 0.1  # Entropy coefficient (increased from 0.01 to encourage exploration)
+  entropy_annealing: true  # Enable entropy annealing
+  entropy_annealing_start: 0.1  # Starting entropy coefficient
+  entropy_annealing_end: 0.01  # Final entropy coefficient
+  entropy_annealing_steps: 5000  # Steps over which to anneal entropy
   max_grad_norm: 0.5  # Maximum gradient norm
 
 # Network architecture

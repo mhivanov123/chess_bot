@@ -11,7 +11,7 @@ from collections import deque
 class ChessActorCritic(nn.Module):
     """Actor-Critic network for chess."""
     
-    def __init__(self, input_channels: int = 12, hidden_layers: List[int] = [512, 256, 128], 
+    def __init__(self, input_channels: int = 13, hidden_layers: List[int] = [512, 256, 128], 
                  num_actions: int = 4352, dropout: float = 0.1):
         super(ChessActorCritic, self).__init__()
         
@@ -33,7 +33,63 @@ class ChessActorCritic(nn.Module):
         self.actor = nn.Linear(prev_size, num_actions)
         self.critic = nn.Linear(prev_size, 1)
         
+        # Initialize weights properly to prevent very negative logits
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize network weights to prevent very negative logits."""
+        for module in self.modules():
+            if isinstance(module, nn.Linear):
+                # Use Xavier/Glorot initialization for better gradient flow
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+            elif isinstance(module, nn.Conv2d):
+                # Use Kaiming initialization for conv layers
+                nn.init.kaiming_normal_(module.weight, mode='fan_out', nonlinearity='relu')
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+        
+        # Special initialization for the actor head to ensure reasonable initial logits
+        # Initialize with small positive values to avoid very negative logits
+        nn.init.xavier_uniform_(self.actor.weight, gain=0.01)  # Small gain to keep logits reasonable
+        if self.actor.bias is not None:
+            nn.init.zeros_(self.actor.bias)
+        
+        # Initialize critic head normally
+        nn.init.xavier_uniform_(self.critic.weight)
+        if self.critic.bias is not None:
+            nn.init.zeros_(self.critic.bias)
+        
     def forward(self, x):
+        # Ensure x is a torch tensor
+        if not torch.is_tensor(x):
+            x = torch.tensor(x, dtype=torch.float32, device=self.device)
+        # If x is 1D, add batch dimension
+        if x.dim() == 1:
+            # Could be flat or (8,8,13)
+            if x.shape[0] == 8*8*13:
+                x = x.view(1, 8, 8, 13)
+            elif x.shape == (8, 8, 13):
+                x = x.unsqueeze(0)
+            else:
+                raise ValueError(f"Unexpected 1D input shape: {x.shape}")
+        # If x is 2D, could be (batch, 832) or (batch, 8, 8, 13) flattened
+        elif x.dim() == 2:
+            if x.shape[1] == 8*8*13:
+                x = x.view(-1, 8, 8, 13)
+            else:
+                raise ValueError(f"Unexpected 2D input shape: {x.shape}")
+        # If x is 3D, could be (8,8,13)
+        elif x.dim() == 3:
+            if x.shape == (8, 8, 13):
+                x = x.unsqueeze(0)
+            else:
+                raise ValueError(f"Unexpected 3D input shape: {x.shape}")
+        # Now x should be (batch, 8, 8, 13)
+        if x.dim() != 4 or x.shape[1:] != (8, 8, 13):
+            raise ValueError(f"Input to forward() must be (batch, 8, 8, 13), got {x.shape}")
+        # Permute to (batch, 13, 8, 8)
         x = x.permute(0, 3, 1, 2)
         x = F.relu(self.conv1(x))
         x = F.relu(self.conv2(x))
@@ -46,16 +102,13 @@ class ChessActorCritic(nn.Module):
         return self.actor(x), self.critic(x)
     
     def get_action_probs(self, x, legal_actions: List[int] = None):
-        """Get action probabilities with masking."""
+        """Get action probabilities without masking."""
         action_logits, value = self.forward(x)
         
-        if legal_actions is not None:
-            # Mask illegal actions
-            mask = torch.ones(action_logits.size(1), device=action_logits.device) * float('-inf')
-            mask[legal_actions] = 0
-            action_logits = action_logits + mask
+        # No masking - let the agent learn what moves are legal
+        action_probs = F.softmax(action_logits, dim=-1)
         
-        return F.softmax(action_logits, dim=-1), value
+        return action_probs, value
     
     def get_action_probs_batch(self, x, legal_actions_list: List[List[int]] = None):
         """Get action probabilities for a batch with individual masking."""
@@ -71,6 +124,9 @@ class ChessActorCritic(nn.Module):
                     if valid_actions:
                         mask[valid_actions] = 0
                     action_logits[i] = action_logits[i] + mask
+                else:
+                    # If no valid actions, set all to equal probability
+                    action_logits[i] = torch.zeros_like(action_logits[i])
         
         return F.softmax(action_logits, dim=-1), value
 
@@ -86,8 +142,10 @@ class PPOMemory:
         self.action_probs = []
         self.legal_actions_list = []
         self.dones = []
-        
-    def push(self, state, action, reward, value, action_prob, legal_actions, done):
+        self.returns = []  # NEW
+        self.advantages = []  # NEW
+    
+    def push(self, state, action, reward, value, action_prob, legal_actions, done, ret=None, adv=None):
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
@@ -95,11 +153,13 @@ class PPOMemory:
         self.action_probs.append(action_prob)
         self.legal_actions_list.append(legal_actions)
         self.dones.append(done)
+        self.returns.append(ret)
+        self.advantages.append(adv)
     
     def get_batch(self):
         return (np.array(self.states), np.array(self.actions), np.array(self.rewards),
                 np.array(self.values), np.array(self.action_probs), self.legal_actions_list,
-                np.array(self.dones))
+                np.array(self.dones), np.array(self.returns), np.array(self.advantages))
     
     def clear(self):
         self.states.clear()
@@ -109,6 +169,8 @@ class PPOMemory:
         self.action_probs.clear()
         self.legal_actions_list.clear()
         self.dones.clear()
+        self.returns.clear()
+        self.advantages.clear()
     
     def __len__(self):
         return len(self.states)
@@ -119,7 +181,9 @@ class PPOAgent:
     
     def __init__(self, state_shape, num_actions=4352, hidden_layers=[512, 256, 128], 
                  learning_rate=0.0003, gamma=0.99, gae_lambda=0.95, clip_ratio=0.2,
-                 value_coef=0.5, entropy_coef=0.01, max_grad_norm=0.5, device='auto'):
+                 value_coef=0.5, entropy_coef=0.1, max_grad_norm=0.5, device='auto',
+                 entropy_annealing=False, entropy_annealing_start=0.1, 
+                 entropy_annealing_end=0.01, entropy_annealing_steps=5000):
         
         self.gamma = gamma
         self.gae_lambda = gae_lambda
@@ -128,6 +192,13 @@ class PPOAgent:
         self.entropy_coef = entropy_coef
         self.max_grad_norm = max_grad_norm
         self.num_actions = num_actions
+        
+        # Entropy annealing parameters
+        self.entropy_annealing = entropy_annealing
+        self.entropy_annealing_start = entropy_annealing_start
+        self.entropy_annealing_end = entropy_annealing_end
+        self.entropy_annealing_steps = entropy_annealing_steps
+        self.total_steps = 0
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') if device == 'auto' else torch.device(device)
         
@@ -142,23 +213,59 @@ class PPOAgent:
         self.training = True
     
     def select_action(self, state: np.ndarray, legal_actions: List[int]) -> Tuple[int, float, float]:
-        """Select action using current policy."""
+        """Select action using current policy, with action masking (only legal actions can be selected)."""
         if not legal_actions:
-            return 0, 1.0, 0.0
-        
+            # No legal actions: return dummy action (should only happen in terminal states)
+            return 0, 0.0, 0.0
         with torch.no_grad():
             state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            # Use action masking: only legal actions are considered
             action_probs, value = self.network.get_action_probs(state_tensor, legal_actions)
             
-            if self.training:
-                action_dist = torch.distributions.Categorical(action_probs)
-                action = action_dist.sample()
-                action_prob = action_probs[0, action.item()].item()
-            else:
-                action = action_probs.argmax()
-                action_prob = action_probs[0, action.item()].item()
+            # DEBUG: Get the raw logits to understand the root cause
+            action_logits, _ = self.network.forward(state_tensor)
+            logits_for_legal = action_logits[0, legal_actions]
             
-            return action.item(), action_prob, value.item()
+            masked_probs = action_probs[0, legal_actions]
+            masked_probs_sum = masked_probs.sum().item()
+            
+            # Debug prints
+            if torch.isnan(masked_probs).any() or masked_probs_sum == 0.0:
+                print("[WARNING] Invalid masked_probs in select_action!")
+                print(f"  legal_actions: {legal_actions}")
+                print(f"  masked_probs: {masked_probs}")
+                print(f"  masked_probs_sum: {masked_probs_sum}")
+                print(f"  action_probs: {action_probs[0]}")
+                print(f"  DEBUG - Raw logits for legal actions: {logits_for_legal}")
+                print(f"  DEBUG - Raw logits min/max: {action_logits.min().item():.6f}/{action_logits.max().item():.6f}")
+                print(f"  DEBUG - Raw logits mean/std: {action_logits.mean().item():.6f}/{action_logits.std().item():.6f}")
+                print(f"  DEBUG - Logits for legal actions min/max: {logits_for_legal.min().item():.6f}/{logits_for_legal.max().item():.6f}")
+                
+                # Check if this is a network initialization issue
+                if hasattr(self, '_debug_count'):
+                    self._debug_count += 1
+                else:
+                    self._debug_count = 1
+                
+                if self._debug_count <= 3:  # Only print detailed network info for first few occurrences
+                    print(f"  DEBUG - Network parameters stats:")
+                    for name, param in self.network.named_parameters():
+                        if param.requires_grad:
+                            print(f"    {name}: mean={param.mean().item():.6f}, std={param.std().item():.6f}, min={param.min().item():.6f}, max={param.max().item():.6f}")
+                
+                # Fallback: uniform distribution over legal actions
+                masked_probs = torch.ones(len(legal_actions), device=self.device) / len(legal_actions)
+            else:
+                masked_probs = masked_probs / masked_probs_sum  # Renormalize
+            if self.training:
+                action_dist = torch.distributions.Categorical(masked_probs)
+                action_idx = action_dist.sample().item()
+            else:
+                action_idx = masked_probs.argmax().item()
+            # Map back to the actual action index in the full action space
+            selected_action = legal_actions[action_idx]
+            action_prob = masked_probs[action_idx].item()
+            return selected_action, action_prob, value.item()
     
     def compute_gae_returns(self, rewards, values, dones):
         """Compute GAE returns."""
@@ -182,8 +289,25 @@ class PPOAgent:
         
         return returns, advantages
     
-    def train_step(self, states, actions, returns, advantages, old_action_probs, legal_actions_list):
+    def update_entropy_coef(self):
+        """Update entropy coefficient based on annealing schedule."""
+        if self.entropy_annealing and self.total_steps < self.entropy_annealing_steps:
+            # Linear annealing
+            progress = self.total_steps / self.entropy_annealing_steps
+            self.entropy_coef = self.entropy_annealing_start + progress * (self.entropy_annealing_end - self.entropy_annealing_start)
+            
+            # Ensure minimum entropy coefficient to prevent complete determinism
+            min_entropy_coef = 0.001
+            self.entropy_coef = max(self.entropy_coef, min_entropy_coef)
+    
+    def train_step(self, states, actions, old_action_probs, returns, advantages, legal_actions_list=None):
         """Perform one PPO training step."""
+        assert states is not None and (not hasattr(states, 'shape') or states.shape[0] > 0), \
+            "train_step received empty batch! Debug your trajectory collection."
+        
+        # Update entropy coefficient if annealing is enabled
+        self.update_entropy_coef()
+        
         states = torch.FloatTensor(states).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
         returns = torch.FloatTensor(returns).to(self.device)
@@ -211,11 +335,16 @@ class PPOAgent:
         torch.nn.utils.clip_grad_norm_(self.network.parameters(), self.max_grad_norm)
         self.optimizer.step()
         
+        # Increment total steps for entropy annealing
+        self.total_steps += 1
+        
         return {
             'total_loss': total_loss.item(),
             'policy_loss': policy_loss.item(),
             'value_loss': value_loss.item(),
-            'entropy_loss': -entropy.item()
+            'entropy_loss': -entropy.item(),
+            'entropy_coef': self.entropy_coef,
+            'entropy': entropy.item()
         }
     
     def save(self, filepath: str):
@@ -231,4 +360,54 @@ class PPOAgent:
     
     def set_training(self, training: bool):
         self.training = training
-        self.network.train(training) 
+        self.network.train(training)
+    
+    def check_network_health(self, state: np.ndarray) -> Dict[str, Any]:
+        """Check network health by analyzing outputs for a given state."""
+        with torch.no_grad():
+            state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+            action_logits, value = self.network.forward(state_tensor)
+            
+            # Analyze logits
+            logits_stats = {
+                'min': action_logits.min().item(),
+                'max': action_logits.max().item(),
+                'mean': action_logits.mean().item(),
+                'std': action_logits.std().item(),
+                'has_nan': torch.isnan(action_logits).any().item(),
+                'has_inf': torch.isinf(action_logits).any().item(),
+                'all_negative': (action_logits < 0).all().item(),
+                'all_zero': (action_logits == 0).all().item(),
+            }
+            
+            # Analyze probabilities after softmax
+            action_probs = F.softmax(action_logits, dim=-1)
+            probs_stats = {
+                'min': action_probs.min().item(),
+                'max': action_probs.max().item(),
+                'mean': action_probs.mean().item(),
+                'std': action_probs.std().item(),
+                'sum': action_probs.sum().item(),
+                'has_nan': torch.isnan(action_probs).any().item(),
+                'all_zero': (action_probs == 0).all().item(),
+            }
+            
+            # Analyze network parameters
+            param_stats = {}
+            for name, param in self.network.named_parameters():
+                if param.requires_grad:
+                    param_stats[name] = {
+                        'mean': param.mean().item(),
+                        'std': param.std().item(),
+                        'min': param.min().item(),
+                        'max': param.max().item(),
+                        'has_nan': torch.isnan(param).any().item(),
+                        'has_inf': torch.isinf(param).any().item(),
+                    }
+            
+            return {
+                'logits': logits_stats,
+                'probabilities': probs_stats,
+                'value': value.item(),
+                'parameters': param_stats
+            } 

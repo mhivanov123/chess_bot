@@ -12,26 +12,30 @@ class ChessEnv(gym.Env):
     Uses full action space with legal move masking.
     """
     
-    def __init__(self, max_moves: int = 200, reward_material_factor: float = 0.1):
+    def __init__(self, max_moves: int = 200, reward_material_factor: float = 0.1,
+             reward_win: float = 100.0, reward_draw: float = 0.0, reward_loss: float = -100.0):
         super().__init__()
         
         self.max_moves = max_moves
         self.reward_material_factor = reward_material_factor
+        self.reward_win = reward_win
+        self.reward_draw = reward_draw
+        self.reward_loss = reward_loss
         self.board = None
         self.move_count = 0
         
-        # Full action space - all possible moves (from_square * to_square + promotions)
-        self.num_actions = 64 * 64 + 64 * 4  # 4096 + 256 = 4352
+        # Full action space: 64*64 for all from-to, plus 64*3*2 for all possible promotions (excluding underpromotions to king)
+        self.num_actions = 64 * 64 + 64 * 3 * 2  # 4096 + 384 = 4480
         
         # Define observation and action spaces
         self.observation_space = spaces.Box(
-            low=0, high=1, shape=(8, 8, 12), dtype=np.float32
+            low=0, high=1, shape=(8, 8, 13), dtype=np.float32  # 13 channels now
         )
         self.action_space = spaces.Discrete(self.num_actions)
         
     def _board_to_state(self) -> np.ndarray:
         """Convert chess board to neural network input state."""
-        state = np.zeros((8, 8, 12), dtype=np.float32)
+        state = np.zeros((8, 8, 13), dtype=np.float32)  # 13 channels now
         
         piece_channels = {
             chess.PAWN: (0, 6),
@@ -52,52 +56,98 @@ class ChessEnv(gym.Env):
                 white_channel, black_channel = piece_channels[piece_type]
                 channel = white_channel if color else black_channel
                 state[rank, file, channel] = 1.0
+        # Add turn channel: 1.0 if white to move, 0.0 if black to move
+        state[:, :, 12] = 0.0 if self.board.turn == chess.WHITE else 1.0
+
+
         
         return state
     
     def _action_to_move(self, action: int) -> chess.Move:
         """Convert action index to chess move."""
-        if action < 4096:  # Regular moves
+        #print(action)
+        if action < 4096:
             from_square = action // 64
             to_square = action % 64
             return chess.Move(from_square, to_square)
-        else:  # Promotion moves
-            action = action - 4096
-            from_square = action // 4
-            promotion_piece = action % 4 + 1  # QUEEN=1, ROOK=2, BISHOP=3, KNIGHT=4
-            to_square = from_square + (8 if from_square < 56 else -8)  # Move forward/backward
-            return chess.Move(from_square, to_square, promotion_piece)
+        else:
+            # Promotion moves: enumerate all possible pawn promotions (excluding king)
+            # 384 promotion actions: 64 squares * 3 underpromotions * 2 colors
+            promo_action = action - 4096
+            from_square = promo_action // 6
+            promo_type_idx = (promo_action % 6)
+            # 0: Q, 1: R, 2: B, 3: N (white), 4: Q, 5: R, 6: B, 7: N (black)
+            if promo_type_idx < 3:
+                color = chess.WHITE
+                promotion = [chess.QUEEN, chess.ROOK, chess.BISHOP][promo_type_idx]
+                to_square = from_square + 8
+            else:
+                color = chess.BLACK
+                promotion = [chess.QUEEN, chess.ROOK, chess.BISHOP][promo_type_idx - 3]
+                to_square = from_square - 8
+            return chess.Move(from_square, to_square, promotion=promotion)
     
     def _move_to_action(self, move: chess.Move) -> int:
         """Convert chess move to action index."""
         if move.promotion:
-            return 4096 + move.from_square * 4 + (move.promotion - 1)
+            # Only handle Q, R, B promotions for both colors
+            promo_map = {chess.QUEEN: 0, chess.ROOK: 1, chess.BISHOP: 2}
+            if move.from_square < 56:  # White promotion
+                promo_type_idx = promo_map[move.promotion]
+            else:  # Black promotion
+                promo_type_idx = promo_map[move.promotion] + 3
+            return 4096 + move.from_square * 6 + promo_type_idx
         else:
             return move.from_square * 64 + move.to_square
     
     def _get_legal_actions(self) -> List[int]:
         """Get list of legal action indices."""
-        return [self._move_to_action(move) for move in self.board.legal_moves]
+        actions = []
+        for move in self.board.legal_moves:
+            try:
+                action = self._move_to_action(move)
+                # Validate round-trip
+                if self._action_to_move(action) == move:
+                    actions.append(action)
+            except Exception:
+                continue
+        return actions
     
     def _calculate_reward(self) -> float:
-        """Calculate reward based on game state."""
+        """Calculate reward for current position."""
+        # Game ending conditions
         if self.board.is_checkmate():
-            return -1.0 if self.board.turn else 1.0
-        elif self.board.is_stalemate() or self.board.is_insufficient_material():
-            return 0.0
-        elif self.move_count >= self.max_moves:
+            return self.reward_win
+
+        else:
             return 0.0
         
-        # Material advantage
-        piece_values = {chess.PAWN: 1, chess.KNIGHT: 3, chess.BISHOP: 3, 
-                       chess.ROOK: 5, chess.QUEEN: 9, chess.KING: 0}
+        if self.board.is_stalemate() or self.board.is_insufficient_material():
+            return self.reward_draw
         
+        # Material advantage - symmetric for both colors
+        piece_values = {
+            chess.PAWN: 1,
+            chess.KNIGHT: 3,
+            chess.BISHOP: 3,
+            chess.ROOK: 5,
+            chess.QUEEN: 9,
+            chess.KING: 0  # Usually 0, since the king can't be captured
+        }
         white_material = sum(piece_values[piece.piece_type] for square in chess.SQUARES 
                            if (piece := self.board.piece_at(square)) and piece.color)
         black_material = sum(piece_values[piece.piece_type] for square in chess.SQUARES 
                            if (piece := self.board.piece_at(square)) and not piece.color)
         
-        return (white_material - black_material) * self.reward_material_factor
+        material_diff = white_material - black_material
+        
+        # If it's White's turn, positive material_diff is good for White
+        # If it's Black's turn, negative material_diff is good for Black
+        # So we need to flip the sign based on whose turn it is
+        if not self.board.turn:  # Black's turn
+            material_diff = -material_diff
+        
+        return material_diff * self.reward_material_factor
     
     def reset(self, seed: Optional[int] = None) -> Tuple[np.ndarray, Dict[str, Any]]:
         """Reset the environment to initial state."""
@@ -107,6 +157,11 @@ class ChessEnv(gym.Env):
         self.move_count = 0
         
         state = self._board_to_state()
+        
+        # Validate action space mapping
+        if not self._validate_action_space():
+            raise ValueError("Action space mapping is inconsistent!")
+        
         info = {
             'legal_actions': self._get_legal_actions(),
             'legal_moves_san': [self.board.san(move) for move in self.board.legal_moves]
@@ -115,11 +170,20 @@ class ChessEnv(gym.Env):
         return state, info
     
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
-        """Take a step in the environment."""
-        # Convert action to move
-        move = self._action_to_move(action)
-        
-        # Check if move is legal
+        try:
+            move = self._action_to_move(action)
+            # Check that move squares are in bounds (0-63)
+            if not (0 <= move.from_square < 64 and 0 <= move.to_square < 64):
+                raise ValueError(f"Move squares out of bounds: from {move.from_square}, to {move.to_square}")
+        except Exception as e:
+            # Action could not be converted to a valid move (invalid index, etc.)
+            return self._board_to_state(), -10.0, True, False, {
+                'illegal_move': True,
+                'legal_actions': self._get_legal_actions(),
+                'last_move_san': None,
+                'error': str(e)
+            }
+        # Now you can safely check legality
         if move not in self.board.legal_moves:
             return self._board_to_state(), -10.0, True, False, {
                 'illegal_move': True,
@@ -162,3 +226,26 @@ class ChessEnv(gym.Env):
         """Render the current board state."""
         print(self.board)
         print(f"Legal moves: {[self.board.san(move) for move in self.board.legal_moves]}") 
+
+    def _validate_action_space(self):
+        """Validate that action space mapping is consistent."""
+        print("Validating action space mapping...")
+        
+        # Test all legal moves in current position
+        legal_moves = list(self.board.legal_moves)
+        legal_actions = self._get_legal_actions()
+        
+        print(f"Legal moves: {len(legal_moves)}")
+        print(f"Legal actions: {len(legal_actions)}")
+        
+        # Test round-trip conversion for each legal move
+        for move in legal_moves:
+            action = self._move_to_action(move)
+            reconstructed_move = self._action_to_move(action)
+            
+            if move != reconstructed_move:
+                print(f"❌ Mapping error: {move} -> {action} -> {reconstructed_move}")
+                return False
+        
+        print("✅ Action space mapping is consistent!")
+        return True 

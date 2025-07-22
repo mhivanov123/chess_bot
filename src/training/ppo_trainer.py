@@ -7,9 +7,10 @@ from typing import Dict, Any, List, Tuple
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-from ..environment.chess_env import ChessEnv
-from ..agents.ppo_agent import PPOAgent
-from ..utils.config import load_config
+# Fix the import to use absolute imports
+from src.environment.chess_env import ChessEnv
+from src.agents.ppo_agent import PPOAgent
+from src.utils.config import load_config
 
 
 class PPOTrainer:
@@ -40,7 +41,10 @@ class PPOTrainer:
         env_config = self.config['environment']
         self.env = ChessEnv(
             max_moves=env_config['max_moves'],
-            reward_material_factor=env_config['reward_material_factor']
+            reward_material_factor=env_config['reward_material_factor'],
+            reward_win=env_config.get('reward_win', 1.0),
+            reward_draw=env_config.get('reward_draw', 0.0),
+            reward_loss=env_config.get('reward_loss', -1.0)
         )
         
     def setup_agent(self):
@@ -59,7 +63,11 @@ class PPOTrainer:
             clip_ratio=agent_config['clip_ratio'],
             value_coef=agent_config['value_coef'],
             entropy_coef=agent_config['entropy_coef'],
-            max_grad_norm=agent_config['max_grad_norm']
+            max_grad_norm=agent_config['max_grad_norm'],
+            entropy_annealing=agent_config.get('entropy_annealing', False),
+            entropy_annealing_start=agent_config.get('entropy_annealing_start', 0.1),
+            entropy_annealing_end=agent_config.get('entropy_annealing_end', 0.01),
+            entropy_annealing_steps=agent_config.get('entropy_annealing_steps', 5000)
         )
         
         # Training parameters
@@ -90,56 +98,119 @@ class PPOTrainer:
             self.use_tensorboard = False
     
     def collect_trajectory(self) -> Tuple[float, int]:
-        """
-        Collect one trajectory using current policy.
-        
-        Returns:
-            episode_reward: Total reward for the episode
-            episode_length: Number of steps in the episode
-        """
+        """Collect a trajectory for both white and black, ensuring both see terminal reward. Clean, robust version."""
         state, info = self.env.reset()
         legal_actions = info['legal_actions']
+        # 0: white, 1: black
+        trajs = [
+            {k: [] for k in ['states', 'actions', 'action_probs', 'rewards', 'values', 'dones', 'legal_actions']},
+            {k: [] for k in ['states', 'actions', 'action_probs', 'rewards', 'values', 'dones', 'legal_actions']}
+        ]
+        turn = 0
+        done = False
         
-        episode_reward = 0
-        episode_length = 0
+        # DEBUG: Check network health at the start of trajectory collection
+        if hasattr(self, '_health_check_count'):
+            self._health_check_count += 1
+        else:
+            self._health_check_count = 0
+            
+        if self._health_check_count % 50 == 0:  # Check every 50 trajectories
+            health_report = self.agent.check_network_health(state)
+            print(f"\n=== NETWORK HEALTH CHECK (trajectory {self._health_check_count}) ===")
+            print(f"Logits: min={health_report['logits']['min']:.6f}, max={health_report['logits']['max']:.6f}, mean={health_report['logits']['mean']:.6f}")
+            print(f"Probabilities: min={health_report['probabilities']['min']:.6f}, max={health_report['probabilities']['max']:.6f}, sum={health_report['probabilities']['sum']:.6f}")
+            print(f"Value: {health_report['value']:.6f}")
+            if health_report['logits']['all_negative']:
+                print("⚠️  WARNING: All logits are negative!")
+            if health_report['probabilities']['all_zero']:
+                print("⚠️  WARNING: All probabilities are zero!")
+            print("=" * 50)
         
-        while True:
+        while not done:
+            # Store current state for current player
+            traj = trajs[turn]
+            traj['states'].append(state)
+            traj['legal_actions'].append(legal_actions)
             # Select action
             action, action_prob, value = self.agent.select_action(state, legal_actions)
             
-            # Take action
+            # Assert action is legal before stepping
+            traj['actions'].append(action)
+            traj['action_probs'].append(action_prob)
+            traj['values'].append(value)
+            # Step environment
             next_state, reward, done, truncated, info = self.env.step(action)
-            next_legal_actions = info['legal_actions']
-            
-            # Store transition
-            self.agent.memory.push(
-                state, action, reward, value, action_prob, legal_actions, done
+            traj['rewards'].append(reward)
+            traj['dones'].append(done)
+            if not done:
+                state = next_state
+                legal_actions = info['legal_actions']
+                turn = 1 - turn
+        # At this point, the game is over. The loser is the player who did not just move.
+        loser = 1 - turn
+        # Only add dummy terminal state if loser made at least one move
+        if len(trajs[loser]['states']) > 0:
+            # The loser's final state is the state after the winner's move (next_state)
+            # The reward is the terminal reward for losing
+            if self.env.board.is_checkmate():
+                terminal_reward = self.env.reward_loss
+            elif self.env.board.is_stalemate() or self.env.board.is_insufficient_material() or self.env.move_count >= self.env.max_moves:
+                terminal_reward = self.env.reward_draw
+            else:
+                terminal_reward = 0.0
+            for k, v in zip(
+                ['states', 'actions', 'action_probs', 'values', 'legal_actions', 'rewards', 'dones'],
+                [next_state, 0, 0.0, 0.0, [], terminal_reward, True]
+            ):
+                trajs[loser][k].append(v)
+        # Compute returns/advantages, then remove dummy state for loser
+        full_returns = []
+        combined = []
+        for color in [0, 1]:
+            traj = trajs[color]
+            if not traj['rewards']:
+                continue
+            returns, advantages = self.agent.compute_gae_returns(
+                np.array(traj['rewards']), np.array(traj['values']), np.array(traj['dones'])
             )
-            
-            episode_reward += reward
-            episode_length += 1
-            state = next_state
-            legal_actions = next_legal_actions
-            
-            if done or truncated:
-                break
-        
-        return episode_reward, episode_length
+            full_returns.append(traj['rewards'][:])
+            # Remove dummy terminal state for loser
+            if color == loser and len(traj['rewards']) > 1:
+                for k in traj:
+                    traj[k].pop()
+                
+                returns = returns[:-1]
+                advantages = advantages[:-1]
+                
+            for i in range(len(traj['states'])):
+                combined.append({
+                    'state': traj['states'][i],
+                    'action': traj['actions'][i],
+                    'reward': traj['rewards'][i],
+                    'value': traj['values'][i],
+                    'action_prob': traj['action_probs'][i],
+                    'legal_actions': traj['legal_actions'][i],
+                    'done': traj['dones'][i],
+                    'return': returns[i],
+                    'advantage': advantages[i],
+                })
+        # Push to memory
+        for t in combined:
+            self.agent.memory.push(
+                t['state'], t['action'], t['reward'], t['value'], t['action_prob'], t['legal_actions'], t['done'], t['return'], t['advantage']
+            )
+        # Return white's total reward and length for logging
+        return sum(full_returns[0]), len(full_returns[0]), sum(full_returns[1]), len(full_returns[1])
     
     def update_policy(self) -> List[Dict[str, float]]:
         """
         Update policy using collected trajectory.
-        
-        Returns:
-            List of loss dictionaries for each PPO epoch
+        Returns: List of loss dictionaries for each PPO epoch
         """
         # Get trajectory data
-        states, actions, rewards, values, action_probs, legal_actions_list, dones = \
+        states, actions, rewards, values, action_probs, legal_actions_list, dones, returns, advantages = \
             self.agent.memory.get_batch()
-        
-        # Compute GAE returns
-        returns, advantages = self.agent.compute_gae_returns(rewards, values, dones)
-        
         # Train for multiple epochs
         epoch_losses = []
         for _ in range(self.ppo_epochs):
@@ -147,10 +218,8 @@ class PPOTrainer:
                 states, actions, returns, advantages, action_probs, legal_actions_list
             )
             epoch_losses.append(loss_dict)
-        
         # Clear memory
         self.agent.memory.clear()
-        
         return epoch_losses
     
     def evaluate_agent(self, num_games: int = 10) -> Dict[str, float]:
@@ -170,7 +239,7 @@ class PPOTrainer:
         losses = 0
         total_moves = 0
         
-        for _ in range(num_games):
+        for game in range(num_games):
             state, info = self.env.reset()
             legal_actions = info['legal_actions']
             game_moves = 0
@@ -186,14 +255,34 @@ class PPOTrainer:
             
             total_moves += game_moves
             
-            # Determine game outcome
+            # ADD THESE PRINT STATEMENTS HERE
+            print(f"Game {game + 1} ended after {game_moves} moves:")
             if self.env.board.is_checkmate():
+                print("  -> CHECKMATE!")
                 if self.env.board.turn:  # White's turn but checkmated
-                    losses += 1  # Black won
+                    print("  -> Black wins!")
+                    losses += 1
                 else:
-                    wins += 1    # White won
+                    print("  -> White wins!")
+                    wins += 1
+            elif self.env.board.is_stalemate():
+                print("  -> STALEMATE!")
+                draws += 1
+            elif self.env.board.is_insufficient_material():
+                print("  -> INSUFFICIENT MATERIAL!")
+                draws += 1
+            elif self.env.move_count >= self.env.max_moves:
+                print("  -> MOVE LIMIT REACHED!")
+                draws += 1
             else:
-                draws += 1  # Draw
+                print("  -> OTHER TERMINATION!")
+                draws += 1
+            
+            # Print final board state
+            print(f"  Final FEN: {self.env.board.fen()}")
+            print("  Final board:")
+            print(self.env.board)
+            print("-" * 50)
         
         self.agent.set_training(True)
         
@@ -214,12 +303,31 @@ class PPOTrainer:
         
         for episode in tqdm(range(self.num_episodes), desc="Training"):
             # Collect trajectory
-            episode_reward, episode_length = self.collect_trajectory()
-            total_steps += episode_length
+            white_reward, white_length, black_reward, black_length = self.collect_trajectory()
+            total_steps += white_length
+            
+            # ADD THIS DEBUG PRINT - Print every episode for now
+            print(f"Episode {episode}: white_reward={white_reward:.2f}, black_reward={black_reward:.2f}, white_length={white_length}, black_length={black_length}")
+            
+            # Check what happened in the last game
+            if self.env.board.is_checkmate():
+                print(f"  -> Last game ended in CHECKMATE!")
+            elif self.env.board.is_stalemate():
+                print(f"  -> Last game ended in STALEMATE!")
+            elif self.env.board.is_insufficient_material():
+                print(f"  -> Last game ended in INSUFFICIENT MATERIAL!")
+            elif self.env.move_count >= self.env.max_moves:
+                print(f"  -> Last game ended by MOVE LIMIT!")
+            else:
+                print(f"  -> Last game ended for OTHER REASON!")
+            
+            # Print the final board state
+            print(f"  Final FEN: {self.env.board.fen()}")
+            print("-" * 50)
             
             # Store metrics
-            self.episode_rewards.append(episode_reward)
-            self.episode_lengths.append(episode_length)
+            self.episode_rewards.append(white_reward)
+            self.episode_lengths.append(white_length)
             
             # Update policy if enough steps collected
             if total_steps >= self.steps_per_update:
@@ -237,53 +345,59 @@ class PPOTrainer:
                 if self.use_tensorboard:
                     for key, value in avg_losses.items():
                         self.writer.add_scalar(f'Training/{key}', value, episode)
+                    
+                    # Log entropy coefficient for monitoring exploration
+                    if 'entropy_coef' in avg_losses:
+                        self.writer.add_scalar('Training/Entropy_Coefficient', avg_losses['entropy_coef'], episode)
+                    if 'entropy' in avg_losses:
+                        self.writer.add_scalar('Training/Entropy', avg_losses['entropy'], episode)
+                
+                # Print entropy info for monitoring
+                if 'entropy_coef' in avg_losses and 'entropy' in avg_losses:
+                    print(f"  Entropy: {avg_losses['entropy']:.4f}, Entropy Coef: {avg_losses['entropy_coef']:.4f}")
             
             # Log episode metrics
             if self.use_tensorboard:
-                self.writer.add_scalar('Training/Episode_Reward', episode_reward, episode)
-                self.writer.add_scalar('Training/Episode_Length', episode_length, episode)
+                self.writer.add_scalar('Training/Episode_Reward', white_reward, episode)
+                self.writer.add_scalar('Training/Episode_Length', white_length, episode)
             
-            # Evaluation
+            # Evaluation - ADD DEBUG HERE TOO
             if episode % self.eval_freq == 0:
+                print(f"\n=== EVALUATION AT EPISODE {episode} ===")
                 eval_results = self.evaluate_agent()
                 self.eval_results.append(eval_results)
                 
-                print(f"\nEpisode {episode}:")
-                print(f"  Reward: {episode_reward:.2f}")
-                print(f"  Length: {episode_length}")
-                print(f"  Win Rate: {eval_results['win_rate']:.2f}")
-                print(f"  Draw Rate: {eval_results['draw_rate']:.2f}")
-                print(f"  Loss Rate: {eval_results['loss_rate']:.2f}")
+                print(f"Evaluation Results:")
+                print(f"  Win Rate: {eval_results['win_rate']:.3f}")
+                print(f"  Draw Rate: {eval_results['draw_rate']:.3f}")
+                print(f"  Loss Rate: {eval_results['loss_rate']:.3f}")
+                print(f"  Avg Moves: {eval_results['avg_moves']:.1f}")
+                print("=" * 50)
                 
-                if self.losses:
-                    latest_loss = self.losses[-1]
-                    print(f"  Policy Loss: {latest_loss['policy_loss']:.6f}")
-                    print(f"  Value Loss: {latest_loss['value_loss']:.6f}")
-                
+                # Log to tensorboard
                 if self.use_tensorboard:
-                    self.writer.add_scalar('Evaluation/Win_Rate', eval_results['win_rate'], episode)
-                    self.writer.add_scalar('Evaluation/Draw_Rate', eval_results['draw_rate'], episode)
-                    self.writer.add_scalar('Evaluation/Loss_Rate', eval_results['loss_rate'], episode)
-                    self.writer.add_scalar('Evaluation/Avg_Moves', eval_results['avg_moves'], episode)
+                    for key, value in eval_results.items():
+                        self.writer.add_scalar(f'Evaluation/{key}', value, episode)
             
             # Save model
             if episode % self.save_freq == 0:
-                model_path = os.path.join(
-                    self.config['logging']['model_dir'],
-                    f'chess_ppo_episode_{episode}.pth'
-                )
+                model_path = os.path.join(self.config['logging']['model_dir'], 
+                                         f'chess_ppo_episode_{episode}.pth')
                 self.agent.save(model_path)
                 print(f"Model saved to {model_path}")
         
-        # Final save
-        final_model_path = os.path.join(
-            self.config['logging']['model_dir'],
-            'chess_ppo_final.pth'
-        )
-        self.agent.save(final_model_path)
+        # Final evaluation
+        print(f"\n=== FINAL EVALUATION ===")
+        final_eval = self.evaluate_agent()
+        print(f"Final Results:")
+        print(f"  Win Rate: {final_eval['win_rate']:.3f}")
+        print(f"  Draw Rate: {final_eval['draw_rate']:.3f}")
+        print(f"  Loss Rate: {final_eval['loss_rate']:.3f}")
+        print(f"  Avg Moves: {final_eval['avg_moves']:.1f}")
         
-        training_time = time.time() - start_time
-        print(f"\nTraining completed in {training_time:.2f} seconds")
+        # Save final model
+        final_model_path = os.path.join(self.config['logging']['model_dir'], 'chess_ppo_final.pth')
+        self.agent.save(final_model_path)
         print(f"Final model saved to {final_model_path}")
         
         if self.use_tensorboard:

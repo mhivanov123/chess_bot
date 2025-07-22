@@ -12,10 +12,10 @@ import copy
 class ChessNet(nn.Module):
     """
     Neural network for chess position evaluation.
-    Takes 8x8x12 input (piece positions) and outputs Q-values for all actions.
+    Takes 8x8x13 input (piece positions + turn) and outputs Q-values for all actions.
     """
     
-    def __init__(self, input_channels: int = 12, hidden_layers: List[int] = [512, 256, 128], 
+    def __init__(self, input_channels: int = 13, hidden_layers: List[int] = [512, 256, 128], 
                  num_actions: int = 4352, dropout: float = 0.1):
         super(ChessNet, self).__init__()
         
@@ -51,8 +51,8 @@ class ChessNet(nn.Module):
         self.fc_layers = nn.Sequential(*layers)
         
     def forward(self, x):
-        # Input shape: (batch_size, 8, 8, 12)
-        # Convert to (batch_size, 12, 8, 8) for conv layers
+        # Input shape: (batch_size, 8, 8, 13)
+        # Convert to (batch_size, 13, 8, 8) for conv layers
         x = x.permute(0, 3, 1, 2)
         
         # Convolutional layers
