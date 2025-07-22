@@ -281,6 +281,15 @@ class PPOAgent:
             min_entropy_coef = 0.001
             self.entropy_coef = max(self.entropy_coef, min_entropy_coef)
     
+    def update_epsilon(self):
+        """Update epsilon based on annealing schedule, if enabled."""
+        if hasattr(self, 'epsilon_annealing') and self.epsilon_annealing and hasattr(self, 'total_steps') and hasattr(self, 'epsilon_start') and hasattr(self, 'epsilon_end') and hasattr(self, 'epsilon_annealing_steps'):
+            if self.total_steps < self.epsilon_annealing_steps:
+                progress = self.total_steps / self.epsilon_annealing_steps
+                self.epsilon = self.epsilon_start + progress * (self.epsilon_end - self.epsilon_start)
+                self.epsilon = max(self.epsilon, 0.001)
+        # If not enabled, do nothing
+    
     def train_step(self, states, actions, old_action_probs, returns, advantages, legal_actions_list=None):
         """Perform one PPO training step."""
         assert states is not None and (not hasattr(states, 'shape') or states.shape[0] > 0), \
